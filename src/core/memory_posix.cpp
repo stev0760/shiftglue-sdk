@@ -483,6 +483,12 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
+  // Views map through the descriptor, never the name. Drop the name now so
+  // the kernel frees the memory with the last descriptor and view, however
+  // the process ends: the app exits without running destructors, and a crash
+  // or kill never reaches CloseFileMappingHandle, which left every session's
+  // guest memory in /dev/shm until reboot.
+  shm_unlink(full_path.c_str());
   return static_cast<FileMappingHandle>(ret);
 #endif
 }
