@@ -16,9 +16,11 @@
 
 #include <fmt/format.h>
 #include <rex/assert.h>
+#include <rex/filesystem.h>
 #include <rex/image_info.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/ppc/function.h>
 #include <rex/runtime.h>
 #include <rex/stream.h>
@@ -46,6 +48,24 @@
 namespace rex::system {
 
 constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
+
+namespace {
+
+// The generator records a recompiled module's library as its bare target
+// name. LoadLibrary appends ".dll" and searches the executable's folder;
+// dlopen does neither, so elsewhere name the platform's file beside the
+// executable, as the GPU plugin loader does.
+std::filesystem::path RecompiledModuleLibraryPath(const std::string& name) {
+#if REX_PLATFORM_WIN32
+  return std::filesystem::path(name);
+#elif REX_PLATFORM_MAC
+  return rex::filesystem::GetExecutableFolder() / fmt::format("lib{}.dylib", name);
+#else
+  return rex::filesystem::GetExecutableFolder() / fmt::format("lib{}.so", name);
+#endif
+}
+
+}  // namespace
 
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
@@ -760,7 +780,7 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
     }
 
     rex::platform::DynamicLibrary library_local;
-    if (!library_local.Load(std::filesystem::path(recomp->shared_lib_name),
+    if (!library_local.Load(RecompiledModuleLibraryPath(recomp->shared_lib_name),
                             rex::platform::SymbolResolution::kImmediate)) {
       REXSYS_ERROR("Failed to load shared library for module '{}'", recomp->pe_name);
     } else {
