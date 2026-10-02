@@ -4448,7 +4448,8 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
   pipeline_create_info.subpass = 0;
   pipeline_create_info.basePipelineHandle = VK_NULL_HANDLE;
   pipeline_create_info.basePipelineIndex = -1;
-  if (dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_create_info, nullptr,
+  if (dfn.vkCreateGraphicsPipelines(device, command_processor_.GetPersistentPipelineCache(), 1,
+                                    &pipeline_create_info, nullptr,
                                     &pipelines[0]) != VK_SUCCESS) {
     REXGPU_ERROR(
         "VulkanRenderTargetCache: Failed to create the render target ownership "
@@ -4470,7 +4471,8 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
           (dest_sample_count == 2 && !msaa_2x_attachments_supported_ && i == 1) ? 3 : i;
       sample_id_specialization_constant = host_sample_index;
       sample_mask = uint32_t(1) << host_sample_index;
-      if (dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_create_info, nullptr,
+      if (dfn.vkCreateGraphicsPipelines(device, command_processor_.GetPersistentPipelineCache(),
+                                        1, &pipeline_create_info, nullptr,
                                         &pipelines[i]) != VK_SUCCESS) {
         REXGPU_ERROR(
             "VulkanRenderTargetCache: Failed to create the render target "

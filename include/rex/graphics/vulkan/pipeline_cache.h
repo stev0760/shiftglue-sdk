@@ -11,6 +11,7 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdio>
@@ -70,6 +71,15 @@ class VulkanPipelineCache {
                                bool blocking);
   void ShutdownShaderStorage();
   void EndSubmission();
+
+  // The driver's pipeline cache that every pipeline created for the guest goes
+  // through. It is loaded from and saved to the shader storage, so a pipeline
+  // compiled in one run costs a lookup in the next. VK_NULL_HANDLE when the
+  // device refused to create it.
+  VkPipelineCache vk_pipeline_cache() const { return vk_pipeline_cache_; }
+  // Writes the driver's pipeline cache to the shader storage if pipelines were
+  // created since the last save. May be called from any thread.
+  void SavePersistentPipelineCache();
 
   VulkanShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                            uint32_t dword_count);
@@ -471,6 +481,39 @@ class VulkanPipelineCache {
   bool storage_write_flush_pipelines_ = false;
   bool storage_write_thread_shutdown_ = false;
   std::unique_ptr<rex::thread::Thread> storage_write_thread_;
+
+  // The driver's pipeline cache, persisted beside the shader storage. The file
+  // holds a small header of our own (so a truncated or edited file is noticed)
+  // followed by the data vkGetPipelineCacheData returned; the driver's own
+  // header at the start of that data identifies the device and driver build
+  // it is for.
+  REXPACKEDSTRUCT(PersistentPipelineCacheHeader, {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t data_size;
+    uint64_t data_hash;
+    static constexpr uint32_t kMagic = 0x43505658;  // 'XVPC'
+    static constexpr uint32_t kVersion = 1;
+  });
+  // Merges the saved cache into vk_pipeline_cache_ when it is from this device
+  // and driver.
+  void LoadPersistentPipelineCache();
+  // Writes vk_pipeline_cache_ if it is dirty; with force, even if the driver
+  // reports it unchanged in size. Returns whether a file was written.
+  bool WritePersistentPipelineCache(bool force);
+  // The storage write thread's periodic save: when dirty, after a pause in
+  // pipeline creation, or anyway after a while.
+  void MaybeSavePersistentPipelineCache();
+  VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;
+  // Empty while no shader storage is open.
+  std::filesystem::path vk_pipeline_cache_path_;
+  // Set by any thread that created a pipeline through vk_pipeline_cache_.
+  std::atomic<bool> vk_pipeline_cache_dirty_{false};
+  // Serializes saves, which may come from the storage write thread and from
+  // ShutdownShaderStorage.
+  std::mutex vk_pipeline_cache_save_lock_;
+  std::chrono::steady_clock::time_point vk_pipeline_cache_last_save_{};
+  size_t vk_pipeline_cache_saved_size_ = 0;
 
   mutable std::mutex creation_request_lock_;
   std::condition_variable creation_request_cond_;

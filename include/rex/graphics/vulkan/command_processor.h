@@ -158,6 +158,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
                           std::vector<uint32_t>& spirv_out, std::string& error_out) const;
 
+  // The driver pipeline cache the pipeline cache persists between runs, for
+  // every pipeline created while drawing for the guest. VK_NULL_HANDLE before
+  // the pipeline cache exists or when the device has none.
+  VkPipelineCache GetPersistentPipelineCache() const {
+    return pipeline_cache_ ? pipeline_cache_->vk_pipeline_cache() : VK_NULL_HANDLE;
+  }
+
   // Returns the deferred drawing command list for the currently open
   // submission.
   DeferredCommandBuffer& deferred_command_buffer() {
