@@ -5,6 +5,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <string>
+#include <unordered_set>
 
 #include <fmt/format.h>
 
@@ -1814,7 +1817,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
 bool Fh1NativeExecutor::PlanCopy(CopyPlan& plan) {
   plan = CopyPlan();
   const Fh1ResolveFlags flags{config_.depth_float24_round, config_.gamma_as_unorm16,
-                              config_.fixed16_truncated};
+                              config_.fixed16_truncated, true};
   if (!Fh1PlanResolve(register_file_, memory_, flags, plan)) return false;
   if (plan.copy) {
     GetResolveSources(plan.resolve_key, plan.x0, plan.y0, plan.x1, plan.y1, plan.sources);
@@ -1960,6 +1963,17 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
 
   if (plan.skip) {
     Skip(plan.skip);
+    // The stats line only counts skips; name each kind once so a count can
+    // be traced to the formats behind it.
+    static std::mutex logged_mutex;
+    static std::unordered_set<std::string> logged_kinds;
+    {
+      std::lock_guard lock(logged_mutex);
+      if (logged_kinds.insert(std::string(plan.skip) + " " + plan.kind).second) {
+        REXGPU_WARN("FH1 native executor (Vulkan) skipped resolve {} kind={} dest_base={:08X}",
+                    plan.skip, plan.kind, uint32_t(regs[XE_GPU_REG_RB_COPY_DEST_BASE]));
+      }
+    }
     succeeded = false;
   } else if (plan.copy) {
     const uint32_t extent_start = resolve_info.copy_dest_extent_start;

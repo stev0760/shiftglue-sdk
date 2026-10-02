@@ -24,13 +24,14 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
                             // 2: 2x stored as 4x)
   uint fh1_sample_select;   // sanitized xenos::CopySampleSelect
   // pack 0:2 (0: 8_8_8_8, 1: 2_10_10_10, 2: 32_FLOAT, 3: 16_16_16_16_FLOAT,
-  // 4: raw 32-bit word), endian 3:5, swap red/blue 6, float24 rounding 7,
-  // exp bias 8:15 (signed), bytes per texel log2 16:17, gamma targets hold
-  // linear values 18, 16_16[_16_16] hosts keep the full range as snorm / 32 19,
-  // resolution scale - 1 20:21 (the rectangle is then in host pixels and the
-  // destination is the texture cache's scaled resolve range), unscaled
-  // destination 22 (at scale: the rectangle in guest pixels, each written to
-  // the guest layout from its first host pixel).
+  // 4: raw 32-bit word, 5: 16_16_16_16), endian 3:5, swap red/blue 6,
+  // float24 rounding 7, exp bias 8:15 (signed), bytes per texel log2 16:17,
+  // gamma targets hold linear values 18, 16_16[_16_16] hosts keep the full
+  // range as snorm / 32 19, resolution scale - 1 20:21 (the rectangle is then
+  // in host pixels and the destination is the texture cache's scaled resolve
+  // range), unscaled destination 22 (at scale: the rectangle in guest pixels,
+  // each written to the guest layout from its first host pixel), destination
+  // number format 23:25 (xenos::SurfaceNumberFormat, for pack 5).
   uint fh1_dest_info;
   uint fh1_dest_base;       // bytes (scaled: from the scaled range's base, unscaled)
   uint fh1_dest_pitch;      // texels
@@ -73,6 +74,22 @@ uint EndianSwap32(uint value, uint endian) {
     value = (value << 16u) | (value >> 16u);
   }
   return value;
+}
+
+// One fixed-point component of a resolve destination, as the Xenos packs
+// it for the destination number format (Direct3D 11.3 conversion rules).
+uint PackFixed16(float value, uint num_format) {
+  uint packed;
+  if (num_format == 1u) {  // Signed repeating fraction.
+    packed = uint(int(clamp(value, -1.0f, 1.0f) * 32767.0f + (value >= 0.0f ? 0.5f : -0.5f)));
+  } else if (num_format == 2u) {  // Unsigned integer.
+    packed = uint(clamp(value, 0.0f, 65535.0f) + 0.5f);
+  } else if (num_format == 3u) {  // Signed integer.
+    packed = uint(int(clamp(value, -32768.0f, 32767.0f) + (value >= 0.0f ? 0.5f : -0.5f)));
+  } else {  // Unsigned repeating fraction, or anything unexpected.
+    packed = uint(saturate(value) * 65535.0f + 0.5f);
+  }
+  return packed & 0xFFFFu;
 }
 
 uint LoadOwnerWord(uint2 pixel, uint sample, uint half) {
@@ -153,8 +170,15 @@ void main(uint3 thread : SV_DispatchThreadID) {
   } else if (pack == 2u) {
     fh1_memory.Store(address, EndianSwap32(asuint(color.r), endian));
   } else {
-    uint2 words = uint2(f32tof16(color.r) | (f32tof16(color.g) << 16u),
-                        f32tof16(color.b) | (f32tof16(color.a) << 16u));
+    uint2 words;
+    if (pack == 5u) {
+      uint num_format = (fh1_dest_info >> 23u) & 7u;
+      words = uint2(PackFixed16(color.r, num_format) | (PackFixed16(color.g, num_format) << 16u),
+                    PackFixed16(color.b, num_format) | (PackFixed16(color.a, num_format) << 16u));
+    } else {
+      words = uint2(f32tof16(color.r) | (f32tof16(color.g) << 16u),
+                    f32tof16(color.b) | (f32tof16(color.a) << 16u));
+    }
     fh1_memory.Store2(address, uint2(EndianSwap32(words.x, endian), EndianSwap32(words.y, endian)));
   }
 }

@@ -128,6 +128,12 @@ bool Fh1PlanResolve(const RegisterFile& regs, const memory::Memory& memory,
         pack = 3;
         bpb_log2 = 3;
         break;
+      case xenos::TextureFormat::k_16_16_16_16:
+        if (flags.dest_16_16_16_16) {
+          pack = 5;
+          bpb_log2 = 3;
+        }
+        break;
       default:
         break;
     }
@@ -153,7 +159,8 @@ bool Fh1PlanResolve(const RegisterFile& regs, const memory::Memory& memory,
                    (uint32_t(flags.depth_float24_round) << 7) |
                    ((uint32_t(exp_bias) & 0xFF) << 8) | (bpb_log2 << 16) |
                    (uint32_t(flags.gamma_as_unorm16) << 18) |
-                   (uint32_t(!flags.fixed16_truncated) << 19);
+                   (uint32_t(!flags.fixed16_truncated) << 19) |
+                   (uint32_t(dest_info.copy_dest_number) << 23);
   plan.dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
   plan.dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch;
   plan.sample_select = uint32_t(plan.info.copy_dest_coordinate_info.copy_sample_select);

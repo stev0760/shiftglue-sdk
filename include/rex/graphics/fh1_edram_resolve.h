@@ -25,6 +25,8 @@ struct Fh1ResolveFlags {
   bool depth_float24_round = false;
   bool gamma_as_unorm16 = false;
   bool fixed16_truncated = false;
+  // The backend's resolve shader packs 16_16_16_16 destinations (pack 5).
+  bool dest_16_16_16_16 = false;
 };
 
 struct Fh1ResolvePlan {
