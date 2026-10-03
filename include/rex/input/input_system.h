@@ -51,6 +51,8 @@ class InputSystem : public system::IInputSystem {
   X_RESULT GetHostPadState(uint32_t user_index, X_INPUT_STATE* out_state);
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
+  /// Stops every pad's vibration before a hard exit (InputDriver::StopAllVibration).
+  void StopAllVibration();
 
  private:
   /// Re-enumerates every driver and notifies the assignment when the set

@@ -44,6 +44,11 @@ class InputDriver {
   virtual X_RESULT GetDeviceKeystroke(DeviceId id, uint32_t flags,
                                       X_INPUT_KEYSTROKE* out_keystroke) = 0;
 
+  /// Stops every device's vibration and waits for the stop to reach them, for
+  /// a process about to exit without its normal teardown: a pad otherwise
+  /// keeps the last vibration it was sent.
+  virtual void StopAllVibration() {}
+
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
 
   void set_is_active_callback(std::function<bool()> is_active_callback) {

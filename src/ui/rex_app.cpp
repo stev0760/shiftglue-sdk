@@ -523,6 +523,12 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   if (runtime_ && runtime_->kernel_state()) {
     runtime_->kernel_state()->TerminateTitle();
   }
+  // The hard exit below skips the input drivers' teardown, and a pad keeps
+  // the last vibration it was sent: stop it once the title can no longer
+  // start it again.
+  if (runtime_ && runtime_->input_system()) {
+    static_cast<rex::input::InputSystem*>(runtime_->input_system())->StopAllVibration();
+  }
   // Hard-exit rather than run subsystem teardown, which can deadlock on a host
   // lock still held by a straggler TerminateTitle left running. Flush (not
   // ShutdownLogging, which frees loggers a straggler may still use); the OS

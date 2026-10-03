@@ -30,6 +30,10 @@ namespace {
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
 
+// SDL's HIDAPI drivers send rumble from their own thread, about 10 ms apart,
+// and drop what is still queued when the process ends.
+constexpr uint32_t kRumbleStopDeliveryMs = 50;
+
 }  // namespace
 
 SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
@@ -243,6 +247,30 @@ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
                            vibration->right_motor_speed, kRumbleDurationMs)
              ? X_ERROR_SUCCESS
              : X_ERROR_FUNCTION_FAILED;
+}
+
+void SDLInputDriver::StopAllVibration() {
+  // A guest thread the title's termination cut off may still hold the lock:
+  // give up rather than hang the exit.
+  std::unique_lock<std::mutex> guard(controllers_mutex_, std::try_to_lock);
+  for (int attempt = 0; !guard.owns_lock() && attempt < 10; ++attempt) {
+    SDL_Delay(10);
+    guard.try_lock();
+  }
+  if (!guard.owns_lock()) {
+    REXLOG_WARN("SDL: cannot stop controller vibration, the controller list is locked");
+    return;
+  }
+  bool stopped = false;
+  for (const auto& controller : controllers_) {
+    if (controller.sdl) {
+      stopped |= SDL_RumbleGamepad(controller.sdl, 0, 0, 0);
+    }
+  }
+  guard.unlock();
+  if (stopped) {
+    SDL_Delay(kRumbleStopDeliveryMs);
+  }
 }
 
 X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,

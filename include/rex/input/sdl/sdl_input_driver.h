@@ -41,6 +41,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   X_RESULT SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) override;
   X_RESULT GetDeviceKeystroke(DeviceId id, uint32_t flags,
                               X_INPUT_KEYSTROKE* out_keystroke) override;
+  void StopAllVibration() override;
   void OnWindowAvailable(rex::ui::Window* window) override;
 
  private:

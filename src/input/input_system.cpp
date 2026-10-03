@@ -328,6 +328,14 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
   return any_synthetic ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
+void InputSystem::StopAllVibration() {
+  // Not under devices_mutex_: the driver list is fixed after setup, and a
+  // straggling guest thread may hold the device lock at exit.
+  for (auto& driver : drivers_) {
+    driver->StopAllVibration();
+  }
+}
+
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
