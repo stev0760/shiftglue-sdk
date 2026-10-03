@@ -20,6 +20,11 @@
 // runtime's (xboxkrnl_crypt.cpp compiles the same file).
 #include "thirdparty/crypto/sha256.cpp"
 #include "thirdparty/crypto/sha256.h"
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__clang__) || defined(__GNUC__))
+#include <cpuid.h>
+#include <immintrin.h>
+#define REX_FH1_PACK_SHA_NI 1
+#endif
 #endif
 
 namespace rex::graphics {
@@ -30,7 +35,8 @@ constexpr uint32_t kKnownD3D12Features = Fh1ShaderPack::kD3D12FeatureSwitch;
 constexpr size_t kMaximumEntries = 65'535;
 constexpr size_t kMaximumBindings = 255;
 constexpr size_t kMaximumBytecodeSize = 16 * 1024 * 1024;
-constexpr size_t kMaximumPackSize = 1024 * 1024 * 1024;
+// The Vulkan disc corpus is about 1.1 GB of SPIR-V at 2x.
+constexpr size_t kMaximumPackSize = size_t(2) * 1024 * 1024 * 1024;
 
 struct Header {
   char magic[8];
@@ -90,6 +96,94 @@ bool RangeValid(uint64_t offset, uint64_t size, size_t total_size) {
   return offset <= total_size && size <= total_size - offset;
 }
 
+#if defined(REX_FH1_PACK_SHA_NI)
+// SHA-256 with the x86 SHA extensions, which CNG uses on Windows: the portable
+// code took about three seconds a pass over a 1 GB Vulkan pack.
+bool CpuHasShaExtensions() {
+  unsigned int eax, ebx, ecx, edx;
+  if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx) || !(ecx & bit_SSSE3) || !(ecx & bit_SSE4_1)) {
+    return false;
+  }
+  return __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) && (ebx & bit_SHA);
+}
+
+alignas(16) constexpr uint32_t kSha256RoundConstants[64] = {
+    0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4,
+    0xAB1C5ED5, 0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE,
+    0x9BDC06A7, 0xC19BF174, 0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F,
+    0x4A7484AA, 0x5CB0A9DC, 0x76F988DA, 0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7,
+    0xC6E00BF3, 0xD5A79147, 0x06CA6351, 0x14292967, 0x27B70A85, 0x2E1B2138, 0x4D2C6DFC,
+    0x53380D13, 0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85, 0xA2BFE8A1, 0xA81A664B,
+    0xC24B8B70, 0xC76C51A3, 0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070, 0x19A4C116,
+    0x1E376C08, 0x2748774C, 0x34B0BCB5, 0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3,
+    0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7,
+    0xC67178F2};
+
+__attribute__((target("sha,ssse3,sse4.1"))) void Sha256BlocksWithShaExtensions(
+    uint32_t state[8], const uint8_t* data, size_t block_count) {
+  const __m128i byte_swap = _mm_set_epi64x(0x0C0D0E0F08090A0BLL, 0x0405060700010203LL);
+  // The rounds keep the state as ABEF and CDGH.
+  __m128i swapped = _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<__m128i*>(&state[0])), 0xB1);
+  __m128i state1 = _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<__m128i*>(&state[4])), 0x1B);
+  __m128i state0 = _mm_alignr_epi8(swapped, state1, 8);
+  state1 = _mm_blend_epi16(state1, swapped, 0xF0);
+  for (; block_count; --block_count, data += 64) {
+    const __m128i state0_before = state0, state1_before = state1;
+    // Four message words per group of four rounds, the last four groups'
+    // in a ring: group n's words are made from groups n - 4 to n - 1.
+    __m128i words[4];
+    for (size_t i = 0; i < 4; ++i) {
+      words[i] = _mm_shuffle_epi8(
+          _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + 16 * i)), byte_swap);
+    }
+    for (size_t n = 0; n < 16; ++n) {
+      if (n >= 4) {
+        __m128i next = _mm_sha256msg1_epu32(words[n & 3], words[(n + 1) & 3]);
+        next = _mm_add_epi32(next, _mm_alignr_epi8(words[(n + 3) & 3], words[(n + 2) & 3], 4));
+        words[n & 3] = _mm_sha256msg2_epu32(next, words[(n + 3) & 3]);
+      }
+      const __m128i message = _mm_add_epi32(
+          words[n & 3],
+          _mm_load_si128(reinterpret_cast<const __m128i*>(&kSha256RoundConstants[4 * n])));
+      state1 = _mm_sha256rnds2_epu32(state1, state0, message);
+      state0 = _mm_sha256rnds2_epu32(state0, state1, _mm_shuffle_epi32(message, 0x0E));
+    }
+    state0 = _mm_add_epi32(state0, state0_before);
+    state1 = _mm_add_epi32(state1, state1_before);
+  }
+  swapped = _mm_shuffle_epi32(state0, 0x1B);
+  state1 = _mm_shuffle_epi32(state1, 0xB1);
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(&state[0]), _mm_blend_epi16(swapped, state1, 0xF0));
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(&state[4]), _mm_alignr_epi8(state1, swapped, 8));
+}
+
+void Sha256WithShaExtensions(std::span<const uint8_t> bytes,
+                             std::array<uint8_t, 32>& digest_out) {
+  uint32_t state[8] = {0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+                       0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19};
+  const size_t full_blocks = bytes.size() / 64;
+  Sha256BlocksWithShaExtensions(state, bytes.data(), full_blocks);
+  // The rest, the 0x80 marker and the big-endian bit count fill one or two
+  // more blocks.
+  uint8_t tail[128] = {};
+  const size_t tail_size = bytes.size() % 64;
+  std::memcpy(tail, bytes.data() + full_blocks * 64, tail_size);
+  tail[tail_size] = 0x80;
+  const size_t tail_blocks = tail_size < 56 ? 1 : 2;
+  const uint64_t bit_count = uint64_t(bytes.size()) * 8;
+  for (size_t i = 0; i < 8; ++i) {
+    tail[tail_blocks * 64 - 1 - i] = uint8_t(bit_count >> (8 * i));
+  }
+  Sha256BlocksWithShaExtensions(state, tail, tail_blocks);
+  for (size_t i = 0; i < 8; ++i) {
+    digest_out[4 * i] = uint8_t(state[i] >> 24);
+    digest_out[4 * i + 1] = uint8_t(state[i] >> 16);
+    digest_out[4 * i + 2] = uint8_t(state[i] >> 8);
+    digest_out[4 * i + 3] = uint8_t(state[i]);
+  }
+}
+#endif
+
 bool Sha256(std::span<const uint8_t> bytes, std::array<uint8_t, 32>& digest_out) {
 #if defined(_WIN32)
   // CNG uses the CPU's SHA extensions; packs are hundreds of megabytes.
@@ -107,6 +201,13 @@ bool Sha256(std::span<const uint8_t> bytes, std::array<uint8_t, 32>& digest_out)
   BCryptCloseAlgorithmProvider(algorithm, 0);
   return BCRYPT_SUCCESS(status);
 #else
+#if defined(REX_FH1_PACK_SHA_NI)
+  static const bool sha_extensions = CpuHasShaExtensions();
+  if (sha_extensions) {
+    Sha256WithShaExtensions(bytes, digest_out);
+    return true;
+  }
+#endif
   sha256::SHA256 hash;
   hash.add(bytes.data(), bytes.size());
   hash.getHash(digest_out.data());
@@ -255,11 +356,8 @@ bool Fh1ShaderPack::Load(const std::filesystem::path& path, const Config& expect
     if (!BytecodeMagicValid(backend, bytecode)) {
       return fail("invalid_bytecode");
     }
-    std::array<uint8_t, 32> bytecode_digest;
-    if (!Sha256(bytecode, bytecode_digest) ||
-        std::memcmp(bytecode_digest.data(), stored.bytecode_sha256, bytecode_digest.size())) {
-      return fail("bytecode_hash_mismatch");
-    }
+    // The content hash above covers the bytecode too; hashing it again here
+    // doubled the load of a 1 GB pack. The builder checks the entries' hashes.
 
     Entry entry;
     entry.stage = Stage(stored.stage);
