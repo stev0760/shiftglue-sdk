@@ -402,6 +402,16 @@ class VulkanPipelineCache {
   std::atomic<uint64_t> fh1_shader_pack_misses_{0};
   void ObserveTranslation(const VulkanShader& shader,
                           const VulkanShader::VulkanTranslation& translation);
+  // A pack miss's guest microcode, once per variant, in the state's
+  // cache/fh1-shader-misses, which the next shader production translates.
+  void RecordFh1ShaderPackMiss(const Shader& shader, uint64_t modification);
+  std::mutex fh1_shader_miss_mutex_;
+  std::filesystem::path fh1_shader_miss_root_;
+  std::set<std::pair<uint64_t, uint64_t>> fh1_recorded_shader_misses_;
+  // The offline producer's pass (built only into rexgpu-fh1-producer): every
+  // FH1 disc shader variant, translated for the shader translation observer.
+  void ProduceFh1DiscCorpus(const std::filesystem::path& corpus_root,
+                            const std::filesystem::path& cache_root);
 
   struct LayoutUID {
     size_t uid;

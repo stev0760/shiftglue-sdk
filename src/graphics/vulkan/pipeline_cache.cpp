@@ -13,8 +13,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -25,6 +29,7 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/filesystem.h>
@@ -442,7 +447,18 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       shader_storage_root / fmt::format("{:08X}.vk.pipeline_cache", title_id);
   LoadPersistentPipelineCache();
 
-  if (title_id == 0x4D5309C9) {
+  fh1_shader_miss_root_ = title_id == 0x4D5309C9 ? cache_root : std::filesystem::path();
+  bool producing_fh1_shaders = false;
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
+  if (const char* corpus_root = std::getenv("PINYON_SHIFT_FH1_DISC_SHADER_CORPUS_DIR");
+      title_id == 0x4D5309C9 && corpus_root && *corpus_root) {
+    ProduceFh1DiscCorpus(std::filesystem::path(corpus_root), cache_root);
+    // The route after the corpus translates too, without a pack: shaders a
+    // previous pack held would otherwise never reach the capture.
+    producing_fh1_shaders = true;
+  }
+#endif
+  if (title_id == 0x4D5309C9 && !producing_fh1_shaders) {
     const Fh1ShaderPack::Config pack_config = Fh1ShaderPackConfig();
     const auto pack_path =
         shader_storage_shareable_root / Fh1ShaderPack::FileName(title_id, pack_config);
@@ -1379,6 +1395,306 @@ void VulkanPipelineCache::ObserveTranslation(const VulkanShader& shader,
   observer(observation);
 }
 
+namespace {
+
+std::string Fh1ShaderMissFileName(xenos::ShaderType stage, uint64_t hash, uint64_t modification) {
+  return fmt::format("{}-{:016X}-{:016X}.bin",
+                     stage == xenos::ShaderType::kVertex ? "vertex" : "pixel", hash,
+                     modification);
+}
+
+}  // namespace
+
+void VulkanPipelineCache::RecordFh1ShaderPackMiss(const Shader& shader, uint64_t modification) {
+  if (fh1_shader_miss_root_.empty() || shader.ucode_data().empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(fh1_shader_miss_mutex_);
+  if (!fh1_recorded_shader_misses_.emplace(shader.ucode_data_hash(), modification).second) {
+    return;
+  }
+  const std::filesystem::path directory = fh1_shader_miss_root_ / "fh1-shader-misses";
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  // In guest byte order, as the microcode is hashed.
+  std::vector<uint32_t> guest(shader.ucode_data().size());
+  for (size_t i = 0; i < guest.size(); ++i) {
+    guest[i] = rex::byte_swap(shader.ucode_data()[i]);
+  }
+  std::ofstream(directory /
+                    Fh1ShaderMissFileName(shader.type(), shader.ucode_data_hash(), modification),
+                std::ios::binary | std::ios::trunc)
+      .write(reinterpret_cast<const char*>(guest.data()),
+             std::streamsize(guest.size() * sizeof(uint32_t)));
+}
+
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
+void VulkanPipelineCache::ProduceFh1DiscCorpus(const std::filesystem::path& corpus_root,
+                                               const std::filesystem::path& cache_root) {
+  if (!command_processor_.GetShaderTranslationObserver()) {
+    REXGPU_WARN("FH1 disc corpus not translated: no shader capture is open");
+    return;
+  }
+  // The variants FH1 draws its disc programs with, in the SPIR-V translator's
+  // modification layout. These are the D3D12 producer's lists, with the pixel
+  // shader parameter generation and register count moved to their SPIR-V
+  // bits, plus the last six pixel variants, which Vulkan sessions created
+  // besides. A vertex variant is its interpolator mask; a pixel variant
+  // applies to programs with as many interpolators as its contiguous mask.
+  static constexpr uint64_t kVertexModifications[] = {
+      0x0, 0x1, 0x3, 0x7, 0xF, 0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF};
+  static constexpr uint64_t kPixelModifications[] = {
+      0x0000000000000000, 0x0000400000000000, 0x0000000000000001, 0x0000000000010001,
+      0x0000400000000001, 0x0000400000010001, 0x0000430000000001, 0x0000000000000003,
+      0x0000400000000003, 0x0000400000020003, 0x0000450000000003, 0x0000000000000007,
+      0x0000400000000007, 0x0000400000020007, 0x0000400000050007, 0x000000000000000F,
+      0x000000000007000F, 0x00000000000A000F, 0x00000000000E000F, 0x000040000000000F,
+      0x000040000009000F, 0x000000000000001F, 0x000000000015001F, 0x00000000001A001F,
+      0x00004000000D001F, 0x000040000015001F, 0x000000000000003F, 0x000000000016003F,
+      0x00000000002B003F, 0x00000000002D003F, 0x00000D000016003F, 0x000040000000003F,
+      0x000040000019003F, 0x00004000001B003F, 0x00004000002B003F, 0x000000000016007F,
+      0x00000000003B007F, 0x00000000005B007F, 0x00000000006D007F, 0x000000000075007F,
+      0x00000F00001D007F, 0x00000F000035007F, 0x00004000002B007F, 0x000040000040007F,
+      0x00004000005B007F, 0x00000000000700FF, 0x00000000001600FF, 0x0000000000B300FF,
+      0x0000000000EB00FF, 0x0000400000B300FF, 0x0000400000EB00FF, 0x00005100000000FF,
+      0x0000400001DB01FF, 0x0000400003B303FF, 0x00004000001B007F, 0x00004000003B00FF,
+      0x00004000007301FF, 0x00004000000D003F, 0x000040000070007F, 0x00000000003B00FF,
+      0x00000000001B007F, 0x00000000000D003F, 0x0000000000060007};
+  // Single programs' variants no disc metadata predicts, from the D3D12
+  // producer (the same bits in both layouts): car-selection variants made
+  // outside the retail .fxobj corpus, material pairings with fewer live
+  // interpolators than their shared program declares, Recaro Rush route
+  // variants, and autoshow and race vertex shaders paired with pixel shaders
+  // that read fewer interpolators.
+  static constexpr std::pair<uint64_t, uint64_t> kRuntimeVariants[] = {
+      {0xC41DD15CBD361350, 0x00000000000001FF}, {0xCE81AE65F9C5A57B, 0x000000000000007F},
+      {0xD60688109AC80358, 0x000000000000003F}, {0x81EF4F2E5B5DDBD1, 0x00004000000D003F},
+      {0xA81FE6B4247E184B, 0x00004000001B007F}, {0xD445FABAE890A455, 0x00004000007301FF},
+      {0x2399AF5C1A9D6197, 0x000000000000003F}, {0x32E185F90FED70B1, 0x000000000000003F},
+      {0x4018C345028228A2, 0x000000000000007F}, {0x5808EEF89DBCB2EB, 0x000000000000007F},
+      {0x6A9D9846410BB101, 0x000000000000003F}, {0x74ADCE29056221E0, 0x000000000000003F},
+      {0x8107C6FD3171A834, 0x000000000000007F}, {0x8D8A197476841A9A, 0x0000000000000000},
+      {0x9B50C4B2B1CCE0C8, 0x000000000000003F}, {0xAD2C355A6BE1EE87, 0x0000000000000000},
+      {0xD71402231C6EC270, 0x000000000000003F}, {0xFEA060C603F44C7D, 0x000000000000003F},
+      {0x2A69134D6AB961F7, 0x000000000016003F}, {0x94A6380F93364C93, 0x000000000016007F},
+      {0xA4E5DE05DCAF605B, 0x000000000016003F}, {0xD0EFA731CCB32A71, 0x000000000016003F},
+      {0xF6D833A391B89839, 0x000000000016007F}, {0x18AB2AE508FD82EB, 0x000000000000007F},
+      {0xE67462AC487FB369, 0x0000000000000001}, {0xD606035F41900757, 0x000000000000003F},
+      {0xEC8B8A5D5D0171BE, 0x00000000000000FF}, {0x2B2187189DFBFB10, 0x0000000000000007},
+      {0x958D2F74344C7B36, 0x000000000000003F}, {0xAE8FEE9795590D78, 0x000000000000007F},
+      {0xC8DB78EC7C219094, 0x000000000000007F}, {0xFCB6BAC481AA29F2, 0x000000000000007F},
+      // Car pixel shaders paired with fewer live interpolators than their
+      // asset metadata declares.
+      {0x1A0763EC031484A5, 0x000000000016003F}, {0x47B93AEB981C4449, 0x000000000016003F},
+      {0x913B2602741D753F, 0x000000000016003F}, {0xDCE431C38D411674, 0x000000000016003F},
+      {0xF0DB93F778565F3C, 0x000000000016007F}};
+
+  std::array<std::array<std::set<uint64_t>, xenos::kMaxInterpolators + 1>, 2> modifications;
+  for (uint64_t modification : kVertexModifications) {
+    modifications[size_t(xenos::ShaderType::kVertex)]
+                 [rex::bit_count(uint32_t(modification) & 0xFFFF)]
+                     .insert(modification);
+  }
+  for (uint64_t modification : kPixelModifications) {
+    const uint32_t interpolator_mask = uint32_t(modification) & 0xFFFF;
+    if ((interpolator_mask & (interpolator_mask + 1)) == 0) {
+      modifications[size_t(xenos::ShaderType::kPixel)][rex::bit_count(interpolator_mask)].insert(
+          modification);
+    }
+  }
+
+  const uint64_t load_start = rex::chrono::Clock::QueryHostTickCount();
+  size_t failed = 0;
+  // Program hash -> its shader and variants. Shaders are loaded on this
+  // thread, which owns shaders_.
+  std::map<uint64_t, std::pair<VulkanShader*, std::set<uint64_t>>> programs;
+  const auto load_program = [&](xenos::ShaderType stage, const uint8_t* bytes,
+                                uint32_t size) -> VulkanShader* {
+    if (!size || size > 0xFFFF * 4 || size % 12) {
+      ++failed;
+      return nullptr;
+    }
+    std::vector<uint32_t> ucode(size / sizeof(uint32_t));
+    std::memcpy(ucode.data(), bytes, size);
+    const uint64_t hash = XXH3_64bits(ucode.data(), size);
+    VulkanShader* shader = LoadShader(stage, ucode.data(), uint32_t(ucode.size()), hash);
+    programs[hash].first = shader;
+    return shader;
+  };
+
+  // tools/extract-fh1-shader-corpus.py writes one file: "FH1C", version 1 and
+  // a record count, then per record the stage (0 vertex, 1 pixel), the
+  // interpolator count, two reserved bytes, the byte size and the microcode
+  // in guest byte order, the rest little-endian.
+  const std::filesystem::path blob_path = corpus_root / "corpus.blob";
+  std::vector<uint8_t> data;
+  if (std::ifstream blob(blob_path, std::ios::binary | std::ios::ate); blob) {
+    data.resize(size_t(std::streamoff(blob.tellg())));
+    blob.seekg(0);
+    if (!blob.read(reinterpret_cast<char*>(data.data()), std::streamsize(data.size()))) {
+      data.clear();
+    }
+  }
+  uint32_t version = 0, count = 0;
+  if (data.size() < 12 || std::memcmp(data.data(), "FH1C", 4)) {
+    REXGPU_ERROR("FH1 disc corpus {} is missing or not a corpus", rex::path_to_utf8(blob_path));
+    ++failed;
+  } else {
+    std::memcpy(&version, data.data() + 4, sizeof(version));
+    std::memcpy(&count, data.data() + 8, sizeof(count));
+    if (version != 1) {
+      REXGPU_ERROR("FH1 disc corpus {} has unknown version {}", rex::path_to_utf8(blob_path),
+                   version);
+      ++failed;
+    }
+  }
+  size_t offset = 12;
+  for (uint32_t i = 0; version == 1 && i < count; ++i) {
+    if (data.size() - offset < 8) {
+      ++failed;
+      break;
+    }
+    uint32_t size;
+    std::memcpy(&size, data.data() + offset + 4, sizeof(size));
+    if (data.size() - offset - 8 < size) {
+      ++failed;
+      break;
+    }
+    const uint8_t stage_index = data[offset];
+    const uint32_t interpolator_count = data[offset + 1];
+    const uint8_t* ucode = data.data() + offset + 8;
+    offset += 8 + size_t(size);
+    if (stage_index > 1 || interpolator_count > xenos::kMaxInterpolators ||
+        modifications[stage_index][interpolator_count].empty()) {
+      continue;
+    }
+    const xenos::ShaderType stage =
+        stage_index ? xenos::ShaderType::kPixel : xenos::ShaderType::kVertex;
+    if (VulkanShader* shader = load_program(stage, ucode, size)) {
+      programs[shader->ucode_data_hash()].second.insert(
+          modifications[stage_index][interpolator_count].begin(),
+          modifications[stage_index][interpolator_count].end());
+    }
+  }
+  data.clear();
+  data.shrink_to_fit();
+  for (const auto& [hash, modification] : kRuntimeVariants) {
+    if (auto it = programs.find(hash); it != programs.end()) {
+      it->second.second.insert(modification);
+    }
+  }
+
+  // Pack misses recorded by earlier sessions (RecordFh1ShaderPackMiss): title
+  // generated shaders and pairings the disc scan does not predict.
+  size_t recorded_misses = 0;
+  std::error_code miss_error;
+  for (std::filesystem::directory_iterator it(cache_root / "fh1-shader-misses", miss_error), end;
+       !miss_error && it != end; it.increment(miss_error)) {
+    const std::string name = it->path().filename().string();
+    uint64_t hash = 0, modification = 0;
+    char stage_name[9] = {};
+    if (!it->is_regular_file() ||
+        std::sscanf(name.c_str(), "%8[a-z]-%16" SCNx64 "-%16" SCNx64 ".bin", stage_name, &hash,
+                    &modification) != 3) {
+      continue;
+    }
+    const std::string_view stage_string = stage_name;
+    if (stage_string != "vertex" && stage_string != "pixel") {
+      continue;
+    }
+    std::ifstream input(it->path(), std::ios::binary | std::ios::ate);
+    const std::streamoff size = input ? std::streamoff(input.tellg()) : -1;
+    std::vector<uint8_t> bytes(size_t(std::max<std::streamoff>(size, 0)));
+    input.seekg(0);
+    if (size <= 0 || size > 0xFFFF * 4 ||
+        !input.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(size)) ||
+        XXH3_64bits(bytes.data(), bytes.size()) != hash) {
+      ++failed;
+      continue;
+    }
+    if (load_program(stage_string == "vertex" ? xenos::ShaderType::kVertex
+                                              : xenos::ShaderType::kPixel,
+                     bytes.data(), uint32_t(bytes.size()))) {
+      programs[hash].second.insert(modification);
+      ++recorded_misses;
+    }
+  }
+
+  // Each program's variants stay on one worker, with a translator per worker.
+  // A translation is captured and then discarded: the route after this pass
+  // translates what it draws, as without a corpus.
+  std::vector<std::pair<VulkanShader*, std::vector<uint64_t>>> jobs;
+  jobs.reserve(programs.size());
+  for (auto& [hash, program] : programs) {
+    jobs.emplace_back(program.first,
+                      std::vector<uint64_t>(program.second.begin(), program.second.end()));
+  }
+  programs.clear();
+  const uint64_t translation_start = rex::chrono::Clock::QueryHostTickCount();
+  const size_t thread_count =
+      std::min(std::max(size_t(rex::thread::logical_processor_count()), size_t(1)), jobs.size());
+  std::array<std::atomic<size_t>, 2> translated{};
+  std::atomic<size_t> translation_failures{0};
+  std::atomic<size_t> next_job{0};
+  const bool edram_fragment_shader_interlock =
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  const auto worker = [&]() {
+    SpirvShaderTranslator translator(
+        SpirvShaderTranslator::Features(command_processor_.GetVulkanDevice()),
+        render_target_cache_.msaa_2x_attachments_supported(),
+        render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
+        render_target_cache_.draw_resolution_scale_x(),
+        render_target_cache_.draw_resolution_scale_y());
+    string::StringBuffer disasm_buffer;
+    for (size_t job = next_job.fetch_add(1, std::memory_order_relaxed); job < jobs.size();
+         job = next_job.fetch_add(1, std::memory_order_relaxed)) {
+      auto& [shader, shader_modifications] = jobs[job];
+      if (!shader->is_ucode_analyzed()) {
+        shader->AnalyzeUcode(disasm_buffer);
+      }
+      for (uint64_t modification : shader_modifications) {
+        bool is_new = false;
+        auto* translation = static_cast<VulkanShader::VulkanTranslation*>(
+            shader->GetOrCreateTranslation(modification, &is_new));
+        if (!is_new) {
+          continue;
+        }
+        if (translator.TranslateAnalyzedShader(*translation)) {
+          ObserveTranslation(*shader, *translation);
+          translated[size_t(shader->type())].fetch_add(1, std::memory_order_relaxed);
+        } else {
+          translation_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        shader->DestroyTranslation(modification);
+      }
+    }
+  };
+  std::vector<std::unique_ptr<rex::thread::Thread>> threads;
+  for (size_t i = 1; i < thread_count; ++i) {
+    auto thread = rex::thread::Thread::Create({}, worker);
+    assert_not_null(thread);
+    thread->set_name("FH1 Shader Production");
+    threads.push_back(std::move(thread));
+  }
+  worker();
+  for (auto& thread : threads) {
+    rex::thread::Wait(thread.get(), false);
+  }
+  failed += translation_failures.load(std::memory_order_relaxed);
+
+  const uint64_t tick_frequency = rex::chrono::Clock::QueryHostTickFrequency();
+  const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  REXGPU_INFO(
+      "FH1 disc corpus translation took {} ms on {} threads for {} programs (corpus load {} ms)",
+      (now - translation_start) * 1000 / tick_frequency, thread_count, jobs.size(),
+      (translation_start - load_start) * 1000 / tick_frequency);
+  REXGPU_INFO("FH1 shader production added {} recorded pack misses", recorded_misses);
+  REXGPU_INFO("FH1 disc corpus translated {} vertex and {} pixel shader variants with {} failures",
+              translated[size_t(xenos::ShaderType::kVertex)].load(),
+              translated[size_t(xenos::ShaderType::kPixel)].load(), failed);
+}
+#endif  // REXGPU_FH1_SHADER_PRODUCER
+
 bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                                   VulkanShader::VulkanTranslation& translation) {
   VulkanShader& shader = static_cast<VulkanShader&>(translation.shader());
@@ -1420,14 +1736,15 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
   // If this fails the shader will be marked as invalid and ignored later.
   if (!used_precompiled_shader) {
     if (fh1_shader_pack_.size()) {
-      // The runtime translates misses; a capture of the session adds them to
-      // the next pack.
+      // The runtime translates misses; the record makes the next shader
+      // production add them to the pack.
       const uint64_t misses = fh1_shader_pack_misses_.fetch_add(1, std::memory_order_relaxed);
       if (misses < 64) {
         REXGPU_INFO("FH1 precompiled SPIR-V miss {} for {:016X}/{:016X} ({} hits so far)",
                     misses + 1, shader.ucode_data_hash(), translation.modification(),
                     fh1_shader_pack_hits_.load(std::memory_order_relaxed));
       }
+      RecordFh1ShaderPackMiss(shader, translation.modification());
     }
     if (!translator.TranslateAnalyzedShader(translation)) {
       REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored",

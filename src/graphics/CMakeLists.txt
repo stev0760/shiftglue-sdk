@@ -126,6 +126,12 @@ if(REXGLUE_USE_D3D12)
     add_library(rexgpu-fh1-producer SHARED EXCLUDE_FROM_ALL ${REXGPU_FH1_PRODUCER_SOURCES})
     target_compile_definitions(rexgpu-fh1-producer PRIVATE
         REXGPU_FH1_SHADER_PRODUCER=1)
+elseif(REXGLUE_USE_VULKAN)
+    # Vulkan-only hosts: the producer is the plugin plus the disc corpus pass
+    # of VulkanPipelineCache, whose translations the capture makes a pack of.
+    add_library(rexgpu-fh1-producer SHARED EXCLUDE_FROM_ALL ${REXGPU_XENOS_SOURCES})
+    target_compile_definitions(rexgpu-fh1-producer PRIVATE
+        REXGPU_FH1_SHADER_PRODUCER=1)
 endif()
 
 foreach(rexgpu_fh1_target IN ITEMS rexgpu-fh1 rexgpu-fh1-producer)
