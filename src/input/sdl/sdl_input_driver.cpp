@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 
@@ -22,6 +23,11 @@
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
+REXCVAR_DEFINE_INT32(pad_bluetooth_rumble_interval_ms, 50, "Input",
+                     "Shortest time between rumble updates sent to a Bluetooth controller; "
+                     "changes in between are merged (0: send every change)")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::input::sdl {
 
@@ -29,6 +35,16 @@ namespace {
 
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
+
+// The bus type SDL puts in the first field of a joystick GUID (the Linux
+// BUS_BLUETOOTH value). SDL's Linux evdev backend reports no connection state,
+// so this is the only sign of Bluetooth there.
+constexpr uint16_t kGuidBusBluetooth = 0x05;
+
+bool IsBluetooth(SDL_Gamepad* gamepad) {
+  const SDL_GUID guid = SDL_GetJoystickGUID(SDL_GetGamepadJoystick(gamepad));
+  return (guid.data[0] | (guid.data[1] << 8)) == kGuidBusBluetooth;
+}
 
 // SDL's HIDAPI drivers send rumble from their own thread, about 10 ms apart,
 // and drop what is still queued when the process ends.
@@ -240,13 +256,44 @@ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  controller->rumble_low = vibration->left_motor_speed;
+  controller->rumble_high = vibration->right_motor_speed;
+  controller->rumble_pending = true;
+  return SendRumbleLocked(*controller) ? X_ERROR_SUCCESS : X_ERROR_FUNCTION_FAILED;
+}
+
+bool SDLInputDriver::SendRumbleLocked(ControllerState& controller) {
+  if (!controller.rumble_pending) {
+    return true;
+  }
+  const bool changed = controller.rumble_low != controller.rumble_sent_low ||
+                       controller.rumble_high != controller.rumble_sent_high;
+  const uint64_t now = SDL_GetTicks();
+  // Bluetooth LE sends each rumble report as a write the pad must acknowledge:
+  // an Xbox Series pad on BlueZ took about 55 a second, and slower links take
+  // fewer, while titles can change rumble several times a frame. The surplus
+  // queued in bluetoothd, so rumble lagged and played on for minutes after a
+  // stop. Hold the newest request until the interval has passed; DrainAndLock
+  // sends it then.
+  if (changed && controller.bluetooth) {
+    const auto interval =
+        static_cast<uint64_t>(std::max(0, REXCVAR_GET(pad_bluetooth_rumble_interval_ms)));
+    if (now - controller.rumble_sent_ms < interval) {
+      return true;
+    }
+  }
+  controller.rumble_pending = false;
+  if (changed) {
+    controller.rumble_sent_low = controller.rumble_low;
+    controller.rumble_sent_high = controller.rumble_high;
+    controller.rumble_sent_ms = now;
+  }
   // XInput vibration holds until the guest changes it, but SDL rumble expires,
   // and a zero duration expires on the next SDL_UpdateJoysticks. Arm it for
-  // SDL's maximum instead; each call cancels the previous effect anyway.
-  return SDL_RumbleGamepad(controller->sdl, vibration->left_motor_speed,
-                           vibration->right_motor_speed, kRumbleDurationMs)
-             ? X_ERROR_SUCCESS
-             : X_ERROR_FUNCTION_FAILED;
+  // SDL's maximum instead; each call cancels the previous effect anyway. An
+  // unchanged request only renews the expiry and sends nothing to the pad.
+  return SDL_RumbleGamepad(controller.sdl, controller.rumble_low, controller.rumble_high,
+                           kRumbleDurationMs);
 }
 
 void SDLInputDriver::StopAllVibration() {
@@ -269,6 +316,7 @@ void SDLInputDriver::StopAllVibration() {
   }
   guard.unlock();
   if (stopped) {
+    REXLOG_INFO("SDL: stopped controller vibration");
     SDL_Delay(kRumbleStopDeliveryMs);
   }
 }
@@ -445,6 +493,11 @@ std::unique_lock<std::mutex> SDLInputDriver::DrainAndLock() {
   for (const auto& event : events) {
     ProcessEventLocked(event);
   }
+  // The guest polls every frame, so rumble held back by the rate limit goes
+  // out within a frame of its interval ending.
+  for (auto& controller : controllers_) {
+    SendRumbleLocked(controller);
+  }
   return guard;
 }
 
@@ -492,14 +545,16 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   state.sdl = controller;
   state.id = AllocateDeviceId();
   state.state_changed = true;  // XInput starts with packet_number = 1
+  state.bluetooth = IsBluetooth(controller);
   UpdateXCapabilities(state);
   controllers_.push_back(state);
 
   const int ordinal = static_cast<int>(controllers_.size()) - 1;
   SDL_SetGamepadPlayerIndex(controller, ordinal);
 
-  REXLOG_INFO("SDL OnControllerDeviceAdded: connection order {}, device {}.", ordinal,
-              static_cast<uint64_t>(state.id));
+  REXLOG_INFO("SDL OnControllerDeviceAdded: connection order {}, device {}{}.", ordinal,
+              static_cast<uint64_t>(state.id),
+              state.bluetooth ? ", Bluetooth (rumble rate limited)" : "");
 }
 
 void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {

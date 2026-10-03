@@ -68,6 +68,14 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     DeviceId id;
     // Per pad rather than per guest user, so it survives reassignment.
     KeystrokeState keystroke;
+    // Rumble updates to a Bluetooth pad are rate limited; see SendRumbleLocked.
+    bool bluetooth;
+    bool rumble_pending;  // rumble_low/high not handed to SDL yet
+    uint16_t rumble_low;
+    uint16_t rumble_high;
+    uint16_t rumble_sent_low;
+    uint16_t rumble_sent_high;
+    uint64_t rumble_sent_ms;
   };
 
   // WindowListener
@@ -82,6 +90,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OnControllerDeviceRemovedLocked(const SDL_Event& event);
   void OnControllerDeviceAxisMotionLocked(const SDL_Event& event);
   void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
+  bool SendRumbleLocked(ControllerState& controller);
 
   inline uint64_t AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const;
   std::optional<size_t> GetControllerIndexFromInstanceID(SDL_JoystickID instance_id);
